@@ -473,6 +473,46 @@ OAS:   ρ = clip₀¹( ((1 − 2/A) · tr(R²) + tr(R)²) / ((T + 1 − 2/A) · 
 
 **5 · Whitening factor** (MMSE-IRC types only): Cholesky factorization `R_ww[p] = L_p · L_pᴴ`, then `LwInv[:, :, p] = L_p⁻¹` (`cholFactorInv`). The equalizer coefficient kernel uses it to whiten the received signal and the channel per PRB.
 
+##### How L_p⁻¹ is computed (`cholFactorInv`)
+
+Code: [pusch_noise_intf_est.cu:317-484](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L317-L484). It runs once per PRB on R_ww[p], after ε·I has been added and shrinkage applied. The work happens in place in shared memory, with A = nRxAnt threads per PRB. A block's PRBs are processed one after another ([:1061-1065](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L1061-L1065)).
+
+**L is computed explicitly, then inverted.** There is no direct R_ww → L⁻¹ algorithm. Two passes share one buffer: a standard Cholesky factorization, then a triangular inversion. Only L⁻¹ is written to global memory (`LwInv`). L exists only temporarily in shared memory.
+
+**Pass A: Cholesky factorization R_ww = L·Lᴴ** (`cholFactor`, [:317-378](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L317-L378)). It works one column j at a time:
+
+```
+L_jj = sqrt( R_jj − Σ_{k<j} |L_jk|² )                       thread 0                       (:336-342)
+L_ij = ( R_ij − Σ_{k<j} L_ik · conj(L_jk) ) · (1/L_jj),     i > j, thread i, in parallel    (:358-367)
+```
+
+Two storage tricks prepare for pass B:
+
+- **The diagonal holds 1/L_jj, not L_jj** ([:346](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L346)). The division is done once. For a triangular matrix, 1/L_jj is also the diagonal of L⁻¹, so the inverse's diagonal is already finished after pass A.
+- **Each L_ij is mirrored into the upper triangle**, `L(j,i) = L(i,j)` ([:370](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L370)). Pass B can then overwrite the lower triangle with L⁻¹ while it still reads L from the upper copy.
+
+**Pass B: triangular inverse X = L⁻¹** (`triLInv`, [:386-434](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L386-L434)). It solves L·X = I. Thread j computes column j from top to bottom:
+
+```
+X_jj = 1/L_jj                                    (already stored by pass A)
+X_ij = −(1/L_ii) · Σ_{k=j}^{i−1} L_ik · X_kj,    i > j                             (:414-427)
+```
+
+L_ik is read from the mirrored upper copy, and X_kj from earlier rows of the same column in the lower triangle. All A columns are computed in parallel with no further synchronization. As X_ij is written, it overwrites L_ij in the lower triangle.
+
+**Pass C: write-out** ([:472-481](../cuPHY/src/cuphy/pusch_noise_intf_est/pusch_noise_intf_est.cu#L472-L481)). The lower triangle (X) goes to `LwInv[:, :, p]`, and the upper triangle is set to 0.
+
+**2×2 check.** For R = [[a, conj(b)], [b, c]]:
+
+```
+L₁₁ = √a,   L₂₁ = b/√a,   L₂₂ = √(c − |b|²/a)
+
+L⁻¹ = [  1/L₁₁                  0     ]
+      [ −L₂₁/(L₁₁·L₂₂)        1/L₂₂   ]
+```
+
+**No guard on the square root.** If rounding made R_jj − Σ|L_jk|² negative, `sqrtf` would return NaN. The only protection is the ε = 1e-8 diagonal load from point 3, plus the shrinkage in point 4 for algorithms 3 and 4. Compare the LDL factorization of G in step 5, whose pivots are always ≥ 1.
+
 **6 · Scalar noise variance per UE group.** Each block adds `Σ_p tr(R_ww[p])` for its PRBs into the output with `atomicAdd`. The last block to finish (counted with `interCtaSyncCnt`) then computes:
 
 ```
@@ -766,6 +806,171 @@ The kernel is selected by antenna and layer count (`puschRxChEq` in [channel_eq.
 | **Out** | `ChEqDbg` (debug only) | C32F | `[nLayers + nRxAnt, nLayers, NF, NH]` |
 
 `ReeDiagInv` is the inverse of the post-equalizer error variance per layer and subcarrier; the soft demapper uses it to scale LLRs.
+
+#### How R_ww⁻¹ enters the coefficients
+
+All coefficient kernels compute the same MMSE form:
+
+```
+M = Hᴴ R_ww⁻¹,     G = M·H + I,     Ree = G⁻¹,     C = Ree·M
+```
+
+No kernel forms R_ww⁻¹ as an explicit matrix. Step 2 estimates R_ww from the DMRS residual (residual → per-PRB covariance + ε·I → optional shrinkage → Cholesky factorization / σ²; see step 2, points 2–6). What it hands over depends on `eqCoeffAlgo` ([channel_eq.cu:554-555](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L554-L555)):
+
+| `eqCoeffAlgo` | R_ww granularity | R_ww⁻¹ used | Comes from |
+|---|---|---|---|
+| 0 RZF | none | `INV_ZF_REGULARIZER` · I = 3981.07 · I (a fixed σ² ≈ 2.5·10⁻⁴, 36 dB) | constant, [channel_eq_types.cuh:37](../cuPHY/src/cuphy/channel_eq/channel_eq_types.cuh#L37) |
+| 1 MMSE, diagonal noise | one scalar per UE group | (1/σ²_w) · I | `invNoiseVarLin` = 1/σ²_w (step 2, point 6) |
+| 2 MMSE-IRC | full nRxAnt × nRxAnt matrix per PRB | L_p⁻ᴴ L_p⁻¹, applied by whitening | `LwInv[:, :, p]` = L_p⁻¹ (step 2, point 5) |
+| 3 / 4 MMSE-IRC with RBLW / OAS shrinkage | full matrix per PRB, shrunk toward (tr R / A)·I | same as 2 | same as 2, after step 2 point 4 |
+
+**Algorithms 0 and 1 (scalar × identity).** M is just a scaled conjugate transpose ([:744](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L744), [:766](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L766)):
+
+```cpp
+shM(r, c) = cuConj(shH(c, r)) * invDiagReg;   // M = Hᴴ / σ²      (invDiagReg = 1/σ²_w or 3981.07)
+G = M·H;  G(ℓ,ℓ) += ES_INV;                   // G = HᴴH / σ² + I
+```
+
+**Algorithms 2–4 (whitening).** Since R_ww[p] = L_p·L_pᴴ, its inverse is R_ww⁻¹ = (L_p L_pᴴ)⁻¹ = L_p⁻ᴴ L_p⁻¹. The kernel loads the lower-triangular L_p⁻¹ once per PRB (shared by all 12 subcarriers) and whitens the channel ([:3065-3126](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3065-L3126)):
+
+```
+N = L_p⁻¹ · H                       whitened channel; lower-triangular left multiply   (:3076)
+G = Nᴴ·N + I  = Hᴴ R_ww⁻¹ H + I                                                       (:3097)
+M = Nᴴ · L_p⁻¹ = Hᴴ R_ww⁻¹                                                             (:3123)
+```
+
+The remaining steps are the same for every algorithm: the LDL solve gives Ree = G⁻¹ and C = Ree·M, followed by the bias correction below.
+
+Using L⁻¹ instead of R_ww⁻¹ has three advantages. The Cholesky factor is computed once per PRB in step 2, not once per subcarrier. A triangular multiply costs about half as much as a full one. Hermitian symmetry is preserved, so G = NᴴN is positive definite by construction.
+
+**Which kernels actually use `LwInv`.** Only one: `eqMmseIrcCoefCompLowMimoKernel` ([:2823-3262](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L2823-L3262)). It is the only place in `channel_eq.cu` that reads `tInfoLwInv`. `eqMmseCoefCompLowMimoKernel` (nRxAnt ≤ 8) dispatches to it when `eqCoeffAlgo` is 2, 3 or 4. For any other algorithm it dispatches to `eqLegacyMmseCoefCompLowMimoKernel` ([:3338-3358](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3338-L3358)).
+
+The 16- and 64-antenna kernels (`eqMmseCoefCompHighMimoKernel*`, `eqMmseCoefCompMassiveMimoKernel_v1`) contain only the scalar `invDiagReg` path ([:940](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L940), [:1360](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L1360), [:1813](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L1813), [:2250](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L2250)). Its flag `noiseRegFlag` is true only for algorithm 1. So with algorithm 2, 3 or 4 these kernels apparently fall back to the RZF constant 3981.07·I, and they do not do IRC. This conclusion comes from reading the kernel code only; it has not been checked against the host-side configuration rules.
+
+#### How Ree and C are solved: LDL factorization of G (`computeLDL`)
+
+Code: [channel_eq.cu:2731-2806](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L2731-L2806), called at [:3136](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3136). The method is described in the comment at [:2912-2926](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L2912-L2926). The description below follows `eqMmseIrcCoefCompLowMimoKernel`. The legacy and high-MIMO kernels build the same augmented matrix ("A = [G | I | M] → [U | Linv | F] → [U | Ree | C]", [:592](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L592)), but their factorization code was not read here.
+
+**Factorization G = Uᴴ·D·U.** U is unit upper triangular (U_ii = 1) and D is real diagonal. Both are stored in place in `shDU` (G's buffer): D_i on the diagonal, U_ij above it. The values 1/D_i are kept in `shDInv`. For i = 0 … L−1:
+
+```
+D_i  = G_ii − Σ_{k<i} D_k · |U_ki|²                                     (:2776-2781)
+U_ij = ( G_ij − Σ_{k<i} conj(U_ki) · D_k · U_kj ) · (1/D_i),   j > i    (:2792-2799)
+```
+
+Parallelism: one warp per subcarrier. For each row i, lane 0 computes D_i, then L − i − 1 lanes compute the rest of row i of U. A `__syncwarp()` separates the rows.
+
+**One solve gives both Ree and C.** The two linear systems share the same matrix, so they are stacked:
+
+```
+G·Ree = I,   G·C = M     ⇒     Uᴴ·D·U · [ Ree | C ] = [ I | M ]          (L × (L + nRxAnt) right-hand side)
+```
+
+Each lane takes one column of the augmented matrix A = [I | M] and solves it in registers ([:3150-3200](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3150-L3200)):
+
+```
+1. Forward substitution   Uᴴ·Y = A     (unit lower triangular, no division):
+       Y_i = A_i − Σ_{j<i} conj(U_ji) · Y_j
+
+2. Backward substitution  D·U·X = Y:
+       X_i = Y_i · (1/D_i) − Σ_{j>i} U_ij · X_j
+```
+
+The columns that came from I give Ree, but only the diagonal Re(X_ii) is kept, in `shMemBlkReeDiag`. The columns that came from M give C. The bias correction λ (next subsection) is then applied to C.
+
+**Why there is no pivoting or guard.** G = NᴴN + I ⪰ I, so every LDL pivot satisfies D_i ≥ 1. The division by D_i is always safe, and Ree_ii ≤ 1 follows. Compare the Cholesky factorization of R_ww in step 2, point 5, which has no such guarantee.
+
+##### Is the full inverse Ree = G⁻¹ required?
+
+**No.** Only two quantities are used afterward. The off-diagonal entries of Ree are never used.
+
+| Needed | Used for |
+|---|---|
+| C = G⁻¹·M | the equalizer coefficients |
+| diag(Ree) only | λ = 1/(1 − Ree_ℓℓ) (bias correction) and `ReeDiagInv` = (1 − Ree)/Ree (LLR scaling) |
+
+**What the code does.** It solves the whole stacked system Uᴴ·D·U·[Ree | C] = [I | M], including all L identity columns, so it does compute the full Ree. It then keeps only the diagonal and discards the off-diagonal results ([:3196-3199](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3196-L3199)):
+
+```cpp
+if (col == i) shMemBlkReeDiag(i, FREQ_IDX) = cuReal(regA[i]);
+```
+
+**Why that costs little here.** Each column of [I | M] is solved by its own lane. A whole warp handles one subcarrier and has more lanes than columns. For example, 4 layers and 8 antennas give 4 + 8 = 12 columns for 32 lanes. The extra L columns run on lanes that would otherwise be idle, so they add almost no latency. The cost would matter only when columns outnumber lanes, such as with many antennas.
+
+**Alternative 1: diag(Ree) from C·H.** The bias-correction subsection shows that C·H = I − Ree. This also holds in the IRC kernel, because C·H = Ree·Hᴴ R_ww⁻¹ H = I − Ree there too. So
+
+```
+Ree_ℓℓ = 1 − Re( Σ_r C_ℓr · H_rℓ )
+```
+
+The kernel could solve only G·C = M (nRxAnt right-hand-side columns, no identity columns) and then take one dot product per layer. The cost is FP32 precision. At high SINR, Ree_ℓℓ is small and 1 − (C·H)_ℓℓ loses digits to cancellation: at Ree = 10⁻⁴ (40 dB), the relative error is about 10⁻³. That is still acceptable up to the `MAX_ERROR_PRECISION` cap. The augmented solve avoids the cancellation and is effectively free on idle lanes, which is probably why it was chosen.
+
+**Alternative 2: diag(Ree) from the factorization.** Since G⁻¹ = U⁻¹·D⁻¹·U⁻ᴴ,
+
+```
+Ree_ℓℓ = Σ_k |(U⁻¹)_ℓk|² / D_k
+```
+
+This needs the triangular inverse U⁻¹, which costs about the same as solving the identity columns.
+
+**Summary.** Only diag(Ree) and C are required. The code gets the full Ree as a side effect of solving both systems at once. That costs almost nothing in the low-MIMO kernel, and everything off the diagonal is discarded.
+
+#### MMSE bias correction: dividing by the MMSE gain
+
+Plain MMSE output is biased: it shrinks each layer's constellation toward zero. Step 5 removes the bias by dividing each layer's coefficients by its **MMSE gain**. That gain is the diagonal element of the *effective channel* C·H, not of the equalizer matrix C. The code never forms C·H. It gets the same value from the diagonal of Ree.
+
+**Definitions in the code** ([channel_eq.cu:568-588](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L568-L588)), with unit-power symbols (R_xx = I):
+
+```
+G   = Hᴴ R_ww⁻¹ H + I          (enhanced Gram matrix)
+Ree = G⁻¹                      (residual-error covariance)
+C   = Ree · Hᴴ R_ww⁻¹          (MMSE coefficient matrix)
+```
+
+**The effective channel after equalization:**
+
+```
+C·H = Ree · Hᴴ R_ww⁻¹ H = Ree · (G − I) = I − Ree
+```
+
+so the equalized output for layer ℓ is
+
+```
+z_ℓ = (C·H)_ℓℓ · x_ℓ + inter-layer interference + noise
+    = (1 − Ree_ℓℓ) · x_ℓ + …
+```
+
+The MMSE gain is g_ℓ = (C·H)_ℓℓ = 1 − Ree_ℓℓ, which is less than 1. This is the bias.
+
+**Correction** ([:3222-3234](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3222-L3234)). Each row ℓ of C is scaled by λ_ℓ = 1/g_ℓ before it is written to `EqCoef`:
+
+```cpp
+lambda = one / (one - ree);                // λ = 1 / (1 − Ree_ℓℓ) = 1 / g_ℓ
+lambda = min(lambda, MAX_BIAS_LIMIT);      // MAX_BIAS_LIMIT = 10  (channel_eq.cu:67)
+Cres   = shMemBlkC(r, c, FREQ_IDX) * lambda;
+```
+
+```
+C_ub = diag(λ) · C    ⇒    (C_ub·H)_ℓℓ = 1    ⇒    z_ℓ = x_ℓ + e_ℓ   (unbiased)
+```
+
+The correction is folded into the stored coefficients, so the soft-demap kernel (step 6) applies none of its own.
+
+**Effect on the error precision** ([:3241-3261](../cuPHY/src/cuphy/channel_eq/channel_eq.cu#L3241-L3261)). After scaling, the signal power is 1 and the residual-error variance is Ree_ℓℓ/(1 − Ree_ℓℓ)². The stored precision is therefore
+
+```
+ReeDiagInv = 1 / (λ · Ree) = (1 − Ree) / Ree = SINR_MMSE − 1     (unbiased post-equalizer SINR)
+             capped at MAX_ERROR_PRECISION = 10000 (40 dB)           (channel_eq.cu:66)
+```
+
+**The two limits:**
+
+| Constant | Value | Caps | Active when |
+|---|---|---|---|
+| `MAX_BIAS_LIMIT` | 10 | λ, the bias-correction factor | Ree_ℓℓ ≥ 0.9 (very low SINR) |
+| `MAX_ERROR_PRECISION` | 10000 (40 dB) | `ReeDiagInv` | very high SINR; stops oversized LLRs and FP16 overflow (max ≈ 65504) |
+
+The correction is exact only while λ < 10, that is, Ree_ℓℓ < 0.9. Above that, λ stays at 10 and the output remains slightly biased: its gain is 10·(1 − Ree_ℓℓ) < 1. This happens only at very low SINR, where the LLRs are small anyway. The same λ clamp and `ReeDiagInv` cap appear in every coefficient-kernel variant in [channel_eq.cu](../cuPHY/src/cuphy/channel_eq/channel_eq.cu) (around lines 840, 1258, 1673, 2147, 2678 and 3225).
 
 ### Step 6 — Equalization and soft demapping (`channel_eq/`)
 
