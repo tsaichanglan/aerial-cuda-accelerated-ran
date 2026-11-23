@@ -232,8 +232,8 @@ The FlexRAN doc says IRC mode `nEnableIrc == 2` does "2-SC processing". Whether 
 | | cuPHY | FlexRAN |
 |---|---|---|
 | Residual | e = Y − Σ Ĥ·x on DMRS REs (all 12 subcarriers when both CDM groups carry no data) | e = Y − Σ Ĥ·β·x |
-| σ² | mean tr(R_ww) / (nRx·nPrb). The linear value given to the equalizer (`invNoiseVarLin`) has **no degrees-of-freedom correction** | mean\|e\|² × **1/(1 − Σ noiseFac)**. noiseFac comes from a LUT by delay spread, layers, SCS and SNR bucket, and accounts for the noise the filter removed. Applied only when μ ≤ 2 and ≤ 2 layers per CDM group (`phy_cestimate_5gnr_simd.cpp:1661-1686`, `:4151-4197`) |
-| Report correction | +0.5 dB added only in the dB report (`NOISE_EST_CORRECTION_DB`) | The corrected σ² is used everywhere, including the equalizer |
+| σ² | mean tr(R_ww) / (nRx·nPrb). The linear value given to the equalizer (`invNoiseVarLin`) has **no degrees-of-freedom correction** | **As shipped: plain mean\|e\|²**, with no degrees-of-freedom correction. The kernel can multiply by 1/(1 − Σ noiseFac), where noiseFac comes from a LUT by delay spread, layers, SCS and SNR bucket and accounts for the noise the filter removed. That runs only when `noiseScaling == 1`, μ ≤ 2 and ≤ 2 layers per CDM group (`phy_cestimate_5gnr_simd.cpp:1661-1686`, `:4151-4197`). The L1 hard-codes `noiseScaling = 0` (`nr5g/gnb_ul/gnb_ul_phy_pusch.c:1163`), so the correction is off, and the signal power gets no −σ²·noiseFac term |
+| Report correction | +0.5 dB added only in the dB report (`NOISE_EST_CORRECTION_DB`) | None. The same σ² goes to the reports and the equalizer (uncorrected as shipped) |
 | Extra scaling | — | `PuschNoiseScale` × σ² for multi-layer single-UE at μ = 0 (gnb_ul) |
 
 ## 5. Noise-plus-interference covariance (IRC)
@@ -270,7 +270,7 @@ The two forms are mathematically equivalent. cuPHY's Ree = σ²(HᴴH + σ²I)�
 
 | Measurement | cuPHY | FlexRAN |
 |---|---|---|
-| **Pre-eq SNR/SINR** | SinrPreEq = RSRP_dB − NoiseVarPreEq_dB. RSRP uses Σ\|Ĥ\|² with **no noise-bias subtraction**; NoiseVarPreEq includes +0.5 dB | Per (layer, antenna): S = mean\|β_DMRS·Ĥ\|² **− σ²·noiseFac** (`phy_cestimate_5gnr_simd.cpp:1730`), SNR = S/σ². Averaged over antennas, then over the UE's layers, minus 20log β_DMRS. EMA α = 0.125 in gnb |
+| **Pre-eq SNR/SINR** | SinrPreEq = RSRP_dB − NoiseVarPreEq_dB. RSRP uses Σ\|Ĥ\|² with **no noise-bias subtraction**; NoiseVarPreEq includes +0.5 dB | Per (layer, antenna): S = mean\|β_DMRS·Ĥ\|² − σ²·noiseFac (`phy_cestimate_5gnr_simd.cpp:1730`), SNR = S/σ². As shipped `noiseScaling = 0`, so noiseFac = 0 and there is **no noise-bias subtraction** (same as cuPHY). Averaged over antennas, then over the UE's layers, minus 20log β_DMRS. EMA α = 0.125 in gnb |
 | **Post-eq SINR** | Mean over REs and layers of ρ = (1 − Ree)/Ree at one time instance t*, per UE. Only `rsrpMeasKernel_v1` produces it | MIMO path: mean over REs of β/(1 − β), **per layer**, **first channel/data symbol only** (`FR/lib_common/mimo.hpp:349-351`; `phy_pusch_symbol_processing_5gnr_avx512.cpp:487, 821`). DFT-s path: β̄/(1 − β̄), with β averaged over subcarriers first, also first channel symbol only (`:1094-1103`) |
 | **RSRP** | Σ over the UE's **layers** (summed, not averaged) of \|Ĥ\|² per RE per antenna, in dB of digital power | `nSigPwr[r]` is built from the "power bits": **mean\|Y_DMRS / β_DMRS\|²**, the received power (signal + interference + noise), **identical for every layer** (`phy_cestimate_5gnr_simd.cpp:2189, 2417-2426`; `calc_rx_pwr` in `phy_cestimate_5gnr_internal.hpp:886`). Converted to dBm with `Rx0DbfsRadioPower` |
 | **RSSI** | Σ\|Y\|² over the allocation's subcarriers and **all antennas** on the DMRS symbols, divided by the number of symbols, per UE group, in dB. Also per symbol and antenna (`RssiFull`) ([pusch_rssi.cu:331-392](../cuPHY/src/cuphy/pusch_rssi/pusch_rssi.cu#L331-L392)) | (a) Wideband task: per RB, symbol and subband, summed over antennas, in dBm. (b) `nDMRSPwrDBFS`: in-allocation DMRS power averaged over antennas |
@@ -329,7 +329,7 @@ The two forms are mathematically equivalent. cuPHY's Ree = σ²(HᴴH + σ²I)�
 ## 9. Key practical differences
 
 - **Channel estimation.** FlexRAN adapts its filter to SNR and delay spread every slot. cuPHY uses fixed filters and adapts only the delay centring.
-- **Noise.** FlexRAN corrects σ² for the noise the filter removed and passes the corrected value to the equalizer. cuPHY applies only a +0.5 dB correction, and only to the reported value.
+- **Noise.** FlexRAN's kernel can correct σ² for the noise the filter removed (1/(1 − Σ noiseFac)), but the shipped L1 turns this off (`noiseScaling = 0`). So as shipped, both stacks give the equalizer the uncorrected residual power. cuPHY also adds +0.5 dB to the reported value only.
 - **Equalizer.** The math is the same; the bias is handled differently. cuPHY removes the bias in the coefficients. FlexRAN keeps it and absorbs it into the LLR scale. The LLRs are identical in the inner region. FlexRAN's exact max-log outer segments differ from cuPHY's simplified demapper.
 - **Measurements.** The two "RSRP" values are **not comparable**: cuPHY reports |Ĥ|² summed over layers, while FlexRAN reports total received DMRS power per antenna. Post-equalization SINR agrees in definition: both are a linear mean of β/(1 − β) = ρ.
 
@@ -339,7 +339,7 @@ Each item below was checked against the code and has been corrected in the FlexR
 
 1. The kernel source is in the tree, under `sdk/source/phy/lib_*`. This had already been corrected by a separate edit of the FlexRAN doc, which also added SDK links.
 2. §3.4.3: W is a precomputed sinc LUT indexed by SNR in 0.25 dB steps. The default is 1 RB (`nInterpMode = 0`), not 4 RBs.
-3. §3.4.4: α = 1/(1 − Σ noiseFac), applied only when μ ≤ 2 and ≤ 2 layers. The signal power has σ²·noiseFac subtracted.
+3. §3.4.4: α = 1/(1 − Σ noiseFac), applied only when `noiseScaling == 1`, μ ≤ 2 and ≤ 2 layers. The signal power has σ²·noiseFac subtracted. Follow-up: the shipped L1 sets `noiseScaling = 0` (`gnb_ul_phy_pusch.c:1163`), so α = 1 and noiseFac = 0 in practice. A note now says so in §3.4.4, after both the α formula and the P_S formula.
 4. §3.4.4 and §4.4: the power bits are the received DMRS power **divided by** β_DMRS, and the same for all layers. They do not measure desired-signal power.
 5. §3.6: there is also an INR-adaptive shrinkage mode (`N_REFINE = 2`).
 6. §3.4.6: the noise term in R₀ is 0.095·σ², not 0.1·σ², and |R₁|/R₀ is clipped to 1.
